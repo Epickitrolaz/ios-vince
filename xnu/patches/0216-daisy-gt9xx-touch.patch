@@ -1,0 +1,481 @@
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -40,6 +40,12 @@
+  * daisytouch_hid=1 continuously delivers valid reports to SweetHID, dropping
+  * entire malformed frames and releasing stale contacts after 150 ms. Requires
+  * GPIO, power and busywait options; omit daisytouch_reports. Default off.
++ * daisytouch_gt9xx=1 instead drives this handset's Goodix GT917D at 0x5d
++ * (GT9xx protocol) through the same QUP3 transport, rails and GPIOs. It reads
++ * the classic register map (status 0x814E, eight-byte points from 0x814F),
++ * clears the status byte after each frame, and delivers 1080x2280 panel
++ * coordinates through sweet_hid_touch(). It takes precedence over all FT5446
++ * options, defaults off, and never writes configuration or firmware.
+  */
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <sys/param.h>
+@@ -131,16 +137,27 @@
+ #define TOUCH_POLL_MS   8
+ #define FTS_ADDR        0x38
+ #define FTS_REPORT_LEN  63
++#define GT9XX_ADDR      0x5d
++#define GT9XX_REG_CONFIG 0x8047u        /* config version, first config byte */
++#define GT9XX_REG_PRODUCT 0x8140u       /* four ASCII bytes, firmware, resolution */
++#define GT9XX_REG_STATUS 0x814eu        /* bit7 ready, bits3:0 touch count */
++#define GT9XX_REG_POINT 0x814fu         /* eight-byte records: id, x, y, w, reserved */
++#define GT9XX_POINT_LEN 8
++#define GT9XX_MAX_POINTS 10
++#define GT9XX_SLOTS     10
++#define GT9XX_POLL_MS   10
++#define GT9XX_STALE_MS  150
+ 
+ static vm_offset_t spmi_core, spmi_cnfg, spmi_obs, tlmm, gcc, qup;
+ static uint32_t qup_in_fifo, qup_out_fifo, qup_clk_ctl = CLK_CTL_400K;
++static unsigned qup_slave;       /* nonzero selects one address for qup_msg() */
+ static int rmi_page = -1;
+ static bool input_started;
+ static int keys_chan, touch_chan;
+ static int daisy_touch, daisy_probe;
+ static int daisy_diag, daisy_gpio, daisy_power;
+ static int daisy_rpm_diag, daisy_reports, daisy_trace, daisy_busywait;
+-static int daisy_hid;
++static int daisy_hid, daisy_gt9xx;
+ static uint32_t qup_last_bus_error, qup_last_error;
+ 
+ static uint32_t
+@@ -276,7 +293,8 @@
+ static int
+ qup_msg(int rd, const uint8_t *tx, uint8_t *rx, uint32_t n)
+ {
+-	uint32_t addr8 = ((daisy_touch ? FTS_ADDR : RMI_ADDR) << 1) | (rd ? 1u : 0u);
++	uint32_t addr8 = ((qup_slave ? qup_slave :
++	    (daisy_touch ? FTS_ADDR : RMI_ADDR)) << 1) | (rd ? 1u : 0u);
+ 	uint32_t ntx = rd ? 2 : n + 1;
+ 	uint32_t cfg = CFG_I2C, got = 0;
+ 	int r;
+@@ -471,6 +489,98 @@
+ 	return r;
+ }
+ 
++/*
++ * GT9xx register reads use a 16-bit big-endian pointer. Send the pointer as
++ * its own QUP message (the proven FT5446/RMI STOP-separated pattern), then
++ * read with input block mode so a whole point block can exceed the FIFO.
++ */
++static int
++qup_read_block(unsigned addr, uint8_t *buf, uint32_t n)
++{
++	uint32_t got = 0;
++	bool block = n >= qup_in_fifo;
++	int r = -1;
++
++	in_wr(qup, QUP_SW_RESET, 1);
++	if (qup_poll(ST_RESET, ST_MASK)) {
++		goto out;
++	}
++	in_wr(qup, QUP_CONFIG, CFG_I2C);
++	if (qup_poll(ST_MAST_GEN, ST_MAST_GEN)) {
++		goto out;
++	}
++	in_wr(qup, QUP_MX_OUT_CNT, 0);
++	in_wr(qup, QUP_MX_WR_CNT, 2);  /* START-R, RECEIVE */
++	in_wr(qup, QUP_MX_IN_CNT, block ? n : 0);
++	in_wr(qup, QUP_MX_RD_CNT, block ? 0 : n);
++	in_wr(qup, QUP_IO_MODE, IO_REPACK | (block ? IO_IN_BLOCK : 0));
++	if (qup_set_state(ST_RUN)) {
++		goto out;
++	}
++	in_wr(qup, QUP_CLK_CTL, qup_clk_ctl);
++	if (qup_set_state(ST_PAUSE)) {
++		goto out;
++	}
++	in_wr(qup, QUP_OUT_FIFO, (TAG_START | (addr << 1) | 1u) | ((TAG_REC | n) << 16));
++	if (qup_set_state(ST_RUN)) {
++		goto out;
++	}
++	for (unsigned t = 0; t < 4000; t++) {
++		if ((r = qup_check_err())) {
++			goto out;
++		}
++		uint32_t op = in_rd(qup, QUP_OPERATIONAL);
++		if (op & (OP_IN_SVC | OP_OUT_SVC)) {
++			in_wr(qup, QUP_OPERATIONAL, op & (OP_IN_SVC | OP_OUT_SVC));
++		}
++		while (got < n && (in_rd(qup, QUP_OPERATIONAL) & OP_IN_NOT_EMPTY)) {
++			uint32_t v = in_rd(qup, QUP_IN_FIFO);
++			buf[got++] = (uint8_t)v;
++			if (got < n) {
++				buf[got++] = (uint8_t)(v >> 16);
++			}
++		}
++		op = in_rd(qup, QUP_OPERATIONAL);
++		if (got == n && (op & OP_MX_IN_DONE) && !(op & OP_OUT_NOT_EMPTY) &&
++		    !(in_rd(qup, QUP_I2C_STATUS) & I2C_BUS_ACTIVE)) {
++			r = qup_check_err(); /* include a late NACK */
++			goto out;
++		}
++		delay(5);
++	}
++	r = -4;
++out:
++	if (r) {
++		/* An incomplete transfer must not leave the bus running. */
++		in_wr(qup, QUP_SW_RESET, 1);
++		(void)qup_poll(ST_RESET, ST_MASK);
++	} else {
++		in_wr(qup, QUP_OPERATIONAL, OP_OUT_SVC | OP_IN_SVC);
++		if (qup_set_state(ST_RESET)) {
++			in_wr(qup, QUP_SW_RESET, 1);
++			r = -1;
++		}
++	}
++	return r;
++}
++
++static int
++qup_reg_read16(unsigned addr, uint16_t reg, uint8_t *buf, uint32_t n)
++{
++	uint8_t ptr[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	int r;
++
++	if (addr > 0x7f || !buf || !n || n > 255 || !qup_in_fifo || qup_out_fifo < 3) {
++		return -5;
++	}
++	qup_slave = addr;
++	r = qup_msg(0, ptr, NULL, sizeof(ptr));
++	if (r) {
++		return r;
++	}
++	return qup_read_block(addr, buf, n);
++}
++
+ /* ---- touch ---- */
+ 
+ static void
+@@ -1384,6 +1494,298 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* ---- Goodix GT917D (GT9xx protocol) ---- */
++
++struct gt9xx_frame {
++	unsigned active;
++	uint16_t x[GT9XX_SLOTS], y[GT9XX_SLOTS];
++};
++
++struct gt9xx_state {
++	struct gt9xx_frame frame;
++	uint64_t last_valid, stale;
++};
++
++static bool
++gt9xx_identity(void)
++{
++	uint8_t id[11] = {0}, cfg = 0;
++	int r = qup_reg_read16(GT9XX_ADDR, GT9XX_REG_PRODUCT, id, sizeof(id));
++	if (!r) {
++		r = qup_reg_read16(GT9XX_ADDR, GT9XX_REG_CONFIG, &cfg, 1);
++	}
++	if (r) {
++		printf("DAISY GT9XX: identity read failed %d (i2c %#x qup %#x)\n", r,
++		    in_rd(qup, QUP_I2C_STATUS), in_rd(qup, QUP_ERROR_FLAGS));
++		return false;
++	}
++	printf("DAISY GT9XX: id %c%c%c%c fw %04x res %ux%u vendor %02x cfg %02x\n",
++	    id[0], id[1], id[2], id[3], id[4] | (id[5] << 8),
++	    id[6] | (id[7] << 8), id[8] | (id[9] << 8), id[10], cfg);
++	return id[0] != 0 && id[0] != 0xff;
++}
++
++/*
++ * Vendor GT917D guitar reset, with daisy's reset/IRQ GPIOs. INT is held low
++ * while RST releases so the controller selects its 0x5d address, then the
++ * 50 ms int-sync pulse ends with both lines as the DT describes them.
++ */
++static bool
++gt9xx_reset(void)
++{
++	/* Reuse the FT5446 path's pins, rails, QUP clock and FIFO discovery. */
++	if (!touch_hw_init()) {
++		return false;
++	}
++	qup_slave = GT9XX_ADDR;
++	tlmm_cfg(GPIO_RST, 0, 3, 3, true, false);
++	in_sleep(&touch_chan, 20);
++	tlmm_cfg(GPIO_ATTN, 0, 0, 7, true, false);
++	delay(1);					/* T3 > 100 us */
++	tlmm_cfg(GPIO_RST, 0, 3, 3, true, true);
++	in_sleep(&touch_chan, 20);			/* T4 > 5 ms */
++	tlmm_cfg(GPIO_RST, 0, 3, 3, false, false);	/* board pull-up holds it high */
++	in_sleep(&touch_chan, 50);			/* int-sync: INT low 50 ms */
++	tlmm_cfg(GPIO_ATTN, 0, 0, 7, false, false);	/* then input, bias as DT */
++	return true;
++}
++
++static int
++gt9xx_read_status(uint8_t *status)
++{
++	return qup_reg_read16(GT9XX_ADDR, GT9XX_REG_STATUS, status, 1);
++}
++
++static void
++gt9xx_clear_status(void)
++{
++	uint8_t end[3] = { GT9XX_REG_STATUS >> 8, GT9XX_REG_STATUS & 0xffu, 0 };
++	(void)qup_msg(0, end, NULL, sizeof(end));
++}
++
++/* Reject the whole frame before publishing any slot: duplicate ids, pen
++ * records, a count over ten, or a coordinate outside the panel are all
++ * malformed. Codes 2..5 are logged once each by the caller.
++ */
++static int
++gt9xx_decode(const uint8_t *p, unsigned count, struct gt9xx_frame *out)
++{
++	struct gt9xx_frame next = {0};
++	unsigned seen = 0;
++
++	if (count > GT9XX_MAX_POINTS) {
++		return 2;
++	}
++	for (unsigned i = 0; i < count; i++, p += GT9XX_POINT_LEN) {
++		unsigned id = p[0] & 0x0fu;
++		unsigned x = p[1] | (p[2] << 8);
++		unsigned y = p[3] | (p[4] << 8);
++		if (p[0] & 0xf0u) {
++			return 3;	/* pen/proximity/hotknot record, not a finger */
++		}
++		if (id >= GT9XX_SLOTS || (seen & (1u << id))) {
++			return 4;
++		}
++		seen |= 1u << id;
++		if (x > 1080 || y > 2280) {
++			return 5;
++		}
++		next.active |= 1u << id;
++		next.x[id] = (uint16_t)x;
++		next.y[id] = (uint16_t)y;
++	}
++	*out = next;
++	return 0;
++}
++
++static void
++gt9xx_release(struct gt9xx_state *s)
++{
++	for (unsigned slot = 0; slot < GT9XX_SLOTS; slot++) {
++		if (s->frame.active & (1u << slot)) {
++			sweet_hid_touch((int)slot, 0, s->frame.x[slot], s->frame.y[slot]);
++		}
++	}
++	s->frame.active = 0;
++}
++
++static void
++gt9xx_expire(struct gt9xx_state *s, uint64_t ms)
++{
++	if (s->frame.active && ms - s->last_valid >= GT9XX_STALE_MS) {
++		gt9xx_release(s);
++		s->stale++;
++	}
++}
++
++static int
++gt9xx_accept(struct gt9xx_state *s, const uint8_t *points, unsigned count, uint64_t ms)
++{
++	struct gt9xx_frame next;
++	int r = gt9xx_decode(points, count, &next);
++
++	gt9xx_expire(s, ms);
++	if (r) {
++		return r;
++	}
++	if (!s->frame.active && next.active) {
++		for (unsigned slot = 0; slot < GT9XX_SLOTS; slot++) {
++			if (next.active & (1u << slot)) {
++				printf("DAISY GT9XX: contact id%u x%u y%u count%u\n",
++				    slot, next.x[slot], next.y[slot], count);
++				break;
++			}
++		}
++	}
++	/* Track ids are slot ids: release missing slots before reporting downs.
++	 * Retry held contacts too, since SweetHID may register after this thread.
++	 * Keep raw panel coordinates; SweetHID owns the display transform.
++	 */
++	for (unsigned slot = 0; slot < GT9XX_SLOTS; slot++) {
++		if ((s->frame.active & ~next.active) & (1u << slot)) {
++			sweet_hid_touch((int)slot, 0, s->frame.x[slot], s->frame.y[slot]);
++		}
++	}
++	for (unsigned slot = 0; slot < GT9XX_SLOTS; slot++) {
++		if (next.active & (1u << slot)) {
++			sweet_hid_touch((int)slot, 1, next.x[slot], next.y[slot]);
++		}
++	}
++	s->frame = next;
++	s->last_valid = ms;
++	return 0;
++}
++
++static void
++gt9xx_thread(void *arg, wait_result_t result)
++{
++	struct gt9xx_state state = {0};
++	uint64_t start, next_log = 10000, next_check = 30000;
++	uint64_t reads = 0, frames = 0, valid = 0, errors = 0, drops = 0;
++	unsigned consecutive = 0, logged = 0;
++	int pr;
++	bool id;
++
++	(void)arg;
++	(void)result;
++	printf("DAISY GT9XX: probe 0x5d, %u slots, poll %u ms; no config writes\n",
++	    GT9XX_SLOTS, GT9XX_POLL_MS);
++	fts_rail_init();
++	fts_rail_summary();
++	pr = daisy_touch_power_on();
++	printf("DAISY GT9XX: RPM power %d\n", pr);
++	in_sleep(&touch_chan, 20);
++	fts_rail_summary();
++	if (!gt9xx_reset()) {
++		printf("DAISY GT9XX: QUP/pin init failed\n");
++		goto out;
++	}
++	id = false;
++	for (unsigned i = 0; i < 5 && !id; i++) {
++		if (i) {
++			in_sleep(&touch_chan, 20);
++		}
++		if (i == 2 && qup_clk_ctl != CLK_CTL_100K) {
++			printf("DAISY GT9XX: identity retry at 100 kHz\n");
++			qup_clk_ctl = CLK_CTL_100K;
++		}
++		id = gt9xx_identity();
++	}
++	if (!id) {
++		printf("DAISY GT9XX: no controller at 0x5d; touch off\n");
++		goto out;
++	}
++	start = mach_absolute_time();
++	for (;;) {
++		uint8_t status = 0;
++		uint64_t ms;
++		int r = gt9xx_read_status(&status);
++		bool bus_error = r != 0;
++
++		ms = fts_capture_elapsed(start);
++		reads++;
++		if (!bus_error && (status & 0x80u)) {
++			unsigned n = status & 15u;
++
++			if (n > GT9XX_MAX_POINTS) {
++				/* Never read past the ten-point buffer. */
++				drops++;
++				if (!(logged & (1u << 2))) {
++					printf("DAISY GT9XX: frame dropped reason 2 count %u\n", n);
++					logged |= 1u << 2;
++				}
++			} else {
++				uint8_t points[GT9XX_MAX_POINTS * GT9XX_POINT_LEN];
++				int decode = 0;
++
++				r = n ? qup_reg_read16(GT9XX_ADDR, GT9XX_REG_POINT,
++				    points, n * GT9XX_POINT_LEN) : 0;
++				if (r) {
++					bus_error = true;
++				} else {
++					frames++;
++					decode = gt9xx_accept(&state, points, n, ms);
++					if (!decode) {
++						valid++;
++					} else {
++						drops++;
++						if (!(logged & (1u << decode))) {
++							printf("DAISY GT9XX: frame dropped reason %d count %u\n",
++							    decode, n);
++							logged |= 1u << decode;
++						}
++					}
++				}
++			}
++			gt9xx_clear_status();
++		} else if (!bus_error) {
++			gt9xx_expire(&state, ms);
++		}
++		if (bus_error) {
++			errors++;
++			consecutive++;
++			if (consecutive <= 3 || !(consecutive % 100u)) {
++				printf("DAISY GT9XX: read error %d consecutive %u (i2c %#x qup %#x)\n",
++				    r, consecutive, in_rd(qup, QUP_I2C_STATUS),
++				    in_rd(qup, QUP_ERROR_FLAGS));
++			}
++			if (consecutive == 10) {
++				gt9xx_release(&state);
++			}
++			if (consecutive >= 100 && (consecutive - 100) % 500u == 0) {
++				printf("DAISY GT9XX: controller lost; resetting\n");
++				gt9xx_release(&state);
++				if (gt9xx_reset() && gt9xx_identity()) {
++					consecutive = 0;
++				} else {
++					in_sleep(&touch_chan, 100);
++				}
++			}
++			gt9xx_expire(&state, ms);
++		} else {
++			consecutive = 0;
++		}
++		if (ms >= next_log) {
++			printf("DAISY GT9XX: ms%llu reads%llu frames%llu valid%llu errors%llu drops%llu active%x stale%llu\n",
++			    (unsigned long long)ms, (unsigned long long)reads,
++			    (unsigned long long)frames, (unsigned long long)valid,
++			    (unsigned long long)errors, (unsigned long long)drops,
++			    state.frame.active, (unsigned long long)state.stale);
++			next_log = ms + 10000;
++		}
++		if (daisy_probe && ms >= next_check && next_check <= 60000) {
++			fts_rail_summary();
++			(void)gt9xx_identity();
++			next_check += 30000;
++		}
++		in_sleep(&touch_chan, GT9XX_POLL_MS);
++	}
++out:
++	gt9xx_release(&state);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -1611,6 +2013,7 @@
+ 	(void)PE_parse_boot_argn("daisytouch_trace", &daisy_trace, sizeof(daisy_trace));
+ 	(void)PE_parse_boot_argn("daisytouch_busywait", &daisy_busywait, sizeof(daisy_busywait));
+ 	(void)PE_parse_boot_argn("daisytouch_hid", &daisy_hid, sizeof(daisy_hid));
++	(void)PE_parse_boot_argn("daisytouch_gt9xx", &daisy_gt9xx, sizeof(daisy_gt9xx));
+ 	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
+ 	if (!tlmm) {
+ 		printf("VINCE INPUT: TLMM mapping failed\n");
+@@ -1632,7 +2035,18 @@
+ 			printf("VINCE INPUT: keys not started\n");
+ 		}
+ 	}
+-	if (touch || daisy_touch) {
++	if (daisy_gt9xx) {
++		/* This unit's Goodix GT917D. Same QUP3/GPIO owner as the FT5446
++		 * paths, but a 16-bit register protocol at 0x5d.
++		 */
++		gcc = ml_io_map(GCC_QUP3_PA, 0x1000);
++		qup = ml_io_map(QUP3_PA, 0x1000);
++		if (gcc && qup && kernel_thread_start(gt9xx_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("VINCE INPUT: GT9xx touch not started\n");
++		}
++	} else if (touch || daisy_touch) {
+ 		bool gpio_only = daisy_touch && daisy_gpio;
+ 		if (!gpio_only) {
+ 			gcc = ml_io_map(GCC_QUP3_PA, 0x1000);
