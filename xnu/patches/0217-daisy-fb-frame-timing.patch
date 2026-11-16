@@ -78,14 +78,18 @@
  	if (fb->fDbg && (fb->fDbgVsync % 240) == 0) {
  		uint32_t ck = 0;
  		if (fb->fPanel != 0 && fb->fPanelRowBytes != 0 && fb->fHeight > 0) {
-@@ -484,10 +521,39 @@
+@@ -484,10 +521,43 @@
  				ck ^= *(const volatile uint32_t *)(fb->fPanel + off);
  			}
  		}
 +		uint32_t winSwap = fb->fDbgSwap - fb->fHbSwap, winFsel = fb->fDbgFlushSel - fb->fHbFsel;
 +		uint32_t winPres = fb->fDbgPres - fb->fHbPres, winDraw = fb->fDbgDraw - fb->fHbDraw;
 +		uint32_t winFlush = fb->fDbgFlush - fb->fHbFlush;
-+		uint32_t winMs = fb->fTimLastHb != 0 ? (uint32_t)((now - fb->fTimLastHb) / 1000000) : 0;
++		uint64_t winNs = 0;
++		if (fb->fTimLastHb != 0) {
++			absolutetime_to_nanoseconds(now - fb->fTimLastHb, &winNs);
++		}
++		uint32_t winMs = (uint32_t)(winNs / 1000000);
 +		fb->fTimLastHb = now;
 +		fb->fHbSwap = fb->fDbgSwap;
 +		fb->fHbFsel = fb->fDbgFlushSel;
@@ -118,7 +122,7 @@
  	}
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
-@@ -536,6 +602,15 @@
+@@ -536,6 +606,15 @@
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
  	fDbgSwap++;
@@ -134,7 +138,7 @@
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
-@@ -559,6 +634,7 @@
+@@ -559,6 +638,7 @@
  AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
  {
  	uint32_t mask = get32(rec, 0x104);
@@ -142,7 +146,7 @@
  	fDbgDraw++;
  
  
-@@ -598,9 +674,17 @@
+@@ -598,9 +678,17 @@
  #if defined(ARM64_BOARD_CONFIG_VINCE)
  		/* A missed frame is preferable to reading an unfinished GPU target.
  		 * Keep the vsync workloop responsive if the GPU stalls. */
@@ -163,7 +167,7 @@
  		}
  #endif
  		uintptr_t src = s->kernelAddress();
-@@ -648,11 +732,13 @@
+@@ -648,11 +736,13 @@
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -177,7 +181,7 @@
  			fDbgCopy++;
  		} else {
  			fDbgSkip++;
-@@ -670,6 +756,7 @@
+@@ -670,6 +760,7 @@
  #else
  	(void)bilinear;
  #endif
@@ -185,7 +189,7 @@
  }
  
  /*
-@@ -734,6 +821,7 @@
+@@ -734,6 +825,7 @@
  void
  AppleCLCD::flushPanel(void)
  {
@@ -193,7 +197,7 @@
  	fDbgFlush++;
  	IOLockLock(fPanelLock);
  	if (fScaled) {
-@@ -759,6 +847,7 @@
+@@ -759,6 +851,7 @@
  			}
  		}
  		IOLockUnlock(fPanelLock);
@@ -201,7 +205,7 @@
  		return;
  	}
  	for (uint32_t y = 0; y < fHeight; y++) {
-@@ -779,6 +868,7 @@
+@@ -779,6 +872,7 @@
  		}
  	}
  	IOLockUnlock(fPanelLock);
@@ -209,7 +213,7 @@
  }
  
  /* One 24-bit pixel between two others, f of the way (0..65535) from a to b. */
-@@ -805,6 +895,7 @@
+@@ -805,6 +899,7 @@
  		flushPanel();           /* no scaling: the nearest sample is the picture */
  		return;
  	}
@@ -217,7 +221,7 @@
  	IOLockLock(fPanelLock);
  	uint32_t barBytes = fBarX * 3, endBytes = (fBarX + fOutW) * 3;
  	for (uint32_t y = 0; y < fHeight; y++) {
-@@ -836,6 +927,7 @@
+@@ -836,6 +931,7 @@
  		}
  	}
  	IOLockUnlock(fPanelLock);
