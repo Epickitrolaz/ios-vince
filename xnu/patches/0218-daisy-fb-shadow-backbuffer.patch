@@ -1,8 +1,6 @@
-diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 2ee7e6b..91bf9f5 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -248,6 +248,28 @@ AppleCLCD::start(IOService *provider)
+@@ -249,6 +249,28 @@
  		fRowBytes = fWidth * 4;
  		fPanelBpp = 3;
  	}
@@ -31,7 +29,7 @@ index 2ee7e6b..91bf9f5 100644
  #endif
  	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
  		IOLog("SWEET FB: no boot framebuffer\n");
-@@ -331,7 +353,7 @@ AppleCLCD::start(IOService *provider)
+@@ -332,7 +354,7 @@
  	}
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
@@ -40,7 +38,7 @@ index 2ee7e6b..91bf9f5 100644
  		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fShadowW, fShadowH, SWEET_FB_FORMAT_BGRA) : NULL;
  	} else
  #else
-@@ -479,7 +501,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -480,7 +502,7 @@
  				}
  			}
  #if defined(ARM64_BOARD_CONFIG_VINCE)
@@ -49,7 +47,7 @@ index 2ee7e6b..91bf9f5 100644
  				fb->flushPanel();
  			}
  #endif
-@@ -743,7 +765,7 @@ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+@@ -746,7 +768,7 @@
  		s->release();
  	}
  #if defined(ARM64_BOARD_CONFIG_VINCE)
@@ -58,7 +56,7 @@ index 2ee7e6b..91bf9f5 100644
  		if (bilinear) {
  			flushPanelBilinear();
  		} else {
-@@ -821,6 +843,22 @@ AppleCLCD::flushPanel(void)
+@@ -824,6 +846,22 @@
  	uint64_t flushStart = fDbg ? mach_absolute_time() : 0;
  	fDbgFlush++;
  	IOLockLock(fPanelLock);
