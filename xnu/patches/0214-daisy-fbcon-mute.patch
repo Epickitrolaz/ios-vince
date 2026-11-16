@@ -8,7 +8,7 @@
 +	 * reach the serial function directly. Drop the character here so nothing
 +	 * can repaint the panel over the UI; panics still draw. */
 +	extern int sweet_console_muted;
-+	extern int panic_active(void);
++	extern unsigned int panic_active(void);
 +	if (sweet_console_muted && !panic_active()) {
 +		return;
 +	}
