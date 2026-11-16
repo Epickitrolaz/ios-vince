@@ -1,0 +1,226 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a403e06..2ee7e6b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -128,6 +128,30 @@ public:
+ 	bool          fDbg;
+ 	uint32_t      fDbgVsync, fDbgSwap, fDbgFlushSel, fDbgPres;
+ 	uint32_t      fDbgWake, fDbgDraw, fDbgCopy, fDbgSkip, fDbgFlush;
++	/*
++	 * fb_dbg=1 timings, microseconds, for the heartbeat's window: drawFrame (whole), layer copies,
++	 * panel flush, surface fence waits and the vsync handler. Each window starts when the previous
++	 * heartbeat printed, and the window counters there show how many of each happened in it.
++	 */
++	struct FbTiming {
++		uint64_t sum;
++		uint32_t max, n;
++		void add(uint64_t start) {
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++			uint32_t us = (uint32_t)(ns / 1000);
++			sum += us;
++			if (us > max) { max = us; }
++			n++;
++		}
++		uint32_t avg(void) const { return n != 0 ? (uint32_t)(sum / n) : 0; }
++		void reset(void) { sum = 0; max = 0; n = 0; }
++	};
++	FbTiming      fTimDraw, fTimCopy, fTimFlush, fTimWait, fTimVsync;
++	uint32_t      fTimWaitFail;    /* fence waits that timed out */
++	uint32_t      fTimGapMaxMs;    /* longest gap between two window-server swaps, this window */
++	uint64_t      fTimLastSwap;
++	uint32_t      fHbSwap, fHbFsel, fHbPres, fHbDraw, fHbFlush;    /* counters at the last heartbeat */
+ 	/* VINCE 24-bpp panel: fPixels/fRowBytes are the 32-bpp shadow, these the real panel memory */
+ 	uint32_t      fPanelBpp;
+ 	uintptr_t     fPanel;
+@@ -353,11 +377,16 @@ AppleCLCD::start(IOService *provider)
+ 	 */
+ 	{
+ 		uint32_t refreshHz = 60, caHz = 0;
++		int norefresh = 0;
+ 		PE_parse_boot_argn("fb_hz", &refreshHz, sizeof(refreshHz));
++		PE_parse_boot_argn("fb_norefresh", &norefresh, sizeof(norefresh));
+ 		if (refreshHz == 0 || refreshHz > 1000) { refreshHz = 60; }
+ 		PE_parse_boot_argn("fb_ca_hz", &caHz, sizeof(caHz));
+ 		if (caHz == 0 || caHz > 1000) { caHz = refreshHz; }
+-		OSDictionary *refresh = OSDictionary::withCapacity(4);
++		OSDictionary *refresh = norefresh ? NULL : OSDictionary::withCapacity(4);
++		if (refresh == NULL && norefresh) {
++			IOLog("SWEET FB: fb_norefresh=1: no IOMFBDisplayRefresh property\n");
++		}
+ 		if (refresh != NULL) {
+ 			uint64_t interval = (1ULL << 32) / caHz, ticks;
+ 			nanoseconds_to_absolutetime(NSEC_PER_SEC / caHz, &ticks);
+@@ -422,6 +451,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	uint64_t vsyncStart = fb->fDbg ? now : 0;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -454,6 +484,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ #endif
+ 		}
++		if (fb->fDbg) {
++			fb->fTimVsync.add(vsyncStart);
++		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+@@ -475,6 +508,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	if (fb->fDbg) {
++		fb->fTimVsync.add(vsyncStart);
++	}
+ 	if (fb->fDbg && (fb->fDbgVsync % 240) == 0) {
+ 		uint32_t ck = 0;
+ 		if (fb->fPanel != 0 && fb->fPanelRowBytes != 0 && fb->fHeight > 0) {
+@@ -484,10 +520,37 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				ck ^= *(const volatile uint32_t *)(fb->fPanel + off);
+ 			}
+ 		}
++		uint32_t winSwap = fb->fDbgSwap - fb->fHbSwap, winFsel = fb->fDbgFlushSel - fb->fHbFsel;
++		uint32_t winPres = fb->fDbgPres - fb->fHbPres, winDraw = fb->fDbgDraw - fb->fHbDraw;
++		uint32_t winFlush = fb->fDbgFlush - fb->fHbFlush;
++		fb->fHbSwap = fb->fDbgSwap;
++		fb->fHbFsel = fb->fDbgFlushSel;
++		fb->fHbPres = fb->fDbgPres;
++		fb->fHbDraw = fb->fDbgDraw;
++		fb->fHbFlush = fb->fDbgFlush;
+ 		IOLog("SWEET HB vs=%u swap=%u fsel=%u pres=%u wake=%u draw=%u cp=%u skip=%u fl=%u dirty=%d off=%d ck=%08x\n",
+ 		    fb->fDbgVsync, fb->fDbgSwap, fb->fDbgFlushSel, fb->fDbgPres, fb->fDbgWake,
+ 		    fb->fDbgDraw, fb->fDbgCopy, fb->fDbgSkip, fb->fDbgFlush, fb->fDirty ? 1 : 0,
+ 		    fb->fPowerOff ? 1 : 0, ck);
++		/*
++		 * The window's rates and timings, in microseconds (avg/max). swap is the window server's own
++		 * rate over the previous 240 vsyncs; draw/copy/flush are the presenter's work in that window,
++		 * so a low swap count with small timings puts the cost in userland, not in the panel path.
++		 */
++		IOLog("SWEET HB2 win swap=%u fsel=%u pres=%u draw=%u fl=%u | us draw=%u/%u copy=%u/%u "
++		    "flush=%u/%u wait=%u/%u fail=%u vsync=%u/%u | gap=%ums\n",
++		    winSwap, winFsel, winPres, winDraw, winFlush,
++		    fb->fTimDraw.avg(), fb->fTimDraw.max, fb->fTimCopy.avg(), fb->fTimCopy.max,
++		    fb->fTimFlush.avg(), fb->fTimFlush.max, fb->fTimWait.avg(), fb->fTimWait.max,
++		    fb->fTimWaitFail, fb->fTimVsync.avg(), fb->fTimVsync.max, fb->fTimGapMaxMs);
++		fb->fTimDraw.reset();
++		fb->fTimCopy.reset();
++		fb->fTimFlush.reset();
++		fb->fTimWait.reset();
++		fb->fTimVsync.reset();
++		fb->fTimWaitFail = 0;
++		fb->fTimGapMaxMs = 0;
++		fb->fTimLastSwap = 0;
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -536,6 +599,15 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	fDbgSwap++;
++	if (fDbg) {
++		uint64_t now = mach_absolute_time(), ns = 0;
++		if (fTimLastSwap != 0) {
++			absolutetime_to_nanoseconds(now - fTimLastSwap, &ns);
++			uint32_t ms = (uint32_t)(ns / 1000000);
++			if (ms > fTimGapMaxMs && ms < 60000) { fTimGapMaxMs = ms; }
++		}
++		fTimLastSwap = now;
++	}
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -559,6 +631,7 @@ void
+ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uint64_t drawStart = fDbg ? mach_absolute_time() : 0;
+ 	fDbgDraw++;
+ 
+ 
+@@ -598,9 +671,17 @@ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 		/* A missed frame is preferable to reading an unfinished GPU target.
+ 		 * Keep the vsync workloop responsive if the GPU stalls. */
+-		if (!vince_surface_wait(s, 16)) {
+-			s->release();
+-			continue;
++		{
++			uint64_t waitStart = fDbg ? mach_absolute_time() : 0;
++			bool ready = vince_surface_wait(s, 16);
++			if (fDbg) {
++				fTimWait.add(waitStart);
++				if (!ready) { fTimWaitFail++; }
++			}
++			if (!ready) {
++				s->release();
++				continue;
++			}
+ 		}
+ #endif
+ 		uintptr_t src = s->kernelAddress();
+@@ -648,11 +729,13 @@ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			uint64_t copyStart = fDbg ? mach_absolute_time() : 0;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			if (fDbg) { fTimCopy.add(copyStart); }
+ 			fDbgCopy++;
+ 		} else {
+ 			fDbgSkip++;
+@@ -670,6 +753,7 @@ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+ #else
+ 	(void)bilinear;
+ #endif
++	if (fDbg) { fTimDraw.add(drawStart); }
+ }
+ 
+ /*
+@@ -734,6 +818,7 @@ AppleCLCD::presenter(void)
+ void
+ AppleCLCD::flushPanel(void)
+ {
++	uint64_t flushStart = fDbg ? mach_absolute_time() : 0;
+ 	fDbgFlush++;
+ 	IOLockLock(fPanelLock);
+ 	if (fScaled) {
+@@ -759,6 +844,7 @@ AppleCLCD::flushPanel(void)
+ 			}
+ 		}
+ 		IOLockUnlock(fPanelLock);
++		if (fDbg) { fTimFlush.add(flushStart); }
+ 		return;
+ 	}
+ 	for (uint32_t y = 0; y < fHeight; y++) {
+@@ -779,6 +865,7 @@ AppleCLCD::flushPanel(void)
+ 		}
+ 	}
+ 	IOLockUnlock(fPanelLock);
++	if (fDbg) { fTimFlush.add(flushStart); }
+ }
+ 
+ /* One 24-bit pixel between two others, f of the way (0..65535) from a to b. */
+@@ -805,6 +892,7 @@ AppleCLCD::flushPanelBilinear(void)
+ 		flushPanel();           /* no scaling: the nearest sample is the picture */
+ 		return;
+ 	}
++	uint64_t flushStart = fDbg ? mach_absolute_time() : 0;
+ 	IOLockLock(fPanelLock);
+ 	uint32_t barBytes = fBarX * 3, endBytes = (fBarX + fOutW) * 3;
+ 	for (uint32_t y = 0; y < fHeight; y++) {
+@@ -836,6 +924,7 @@ AppleCLCD::flushPanelBilinear(void)
+ 		}
+ 	}
+ 	IOLockUnlock(fPanelLock);
++	if (fDbg) { fTimFlush.add(flushStart); }
+ }
+ 
+ #endif

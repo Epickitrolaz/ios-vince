@@ -1,0 +1,83 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2ee7e6b..91bf9f5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -248,6 +248,28 @@ AppleCLCD::start(IOService *provider)
+ 		fRowBytes = fWidth * 4;
+ 		fPanelBpp = 3;
+ 	}
++	/*
++	 * fbshadow=1: the 32-bpp MDP-scaled panel (fbw/fbh) scans out this same framebuffer. CoreAnimation's
++	 * software renderer blends into the surface it is given, so hand it a cached backbuffer instead of the
++	 * write-combined scanout memory (whose reads stall a blend) and copy the finished frame once per present.
++	 * This is the 24-bpp path's arrangement, without the packing: the scanout buffer is already BGRA.
++	 */
++	int shadow = 0;
++	if (fPanelBpp == 4 && fPhys != 0 && fRowBytes >= fWidth * 4 &&
++	    PE_parse_boot_argn("fbshadow", &shadow, sizeof(shadow)) && shadow != 0) {
++		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
++		fPanelMap = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
++		OSSafeReleaseNULL(pm);
++		if (fPanelMap != NULL) {
++			fPanel = (uintptr_t)fPanelMap->getVirtualAddress();
++			fPanelRowBytes = fRowBytes;
++			IOLog("SWEET FB: fbshadow=1: cached %ux%u backbuffer, %u-byte scanout rows\n",
++			    fWidth, fHeight, fPanelRowBytes);
++		} else {
++			IOLog("SWEET FB: fbshadow=1: no scanout mapping, direct surface\n");
++		}
++	}
+ #endif
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+@@ -331,7 +353,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	if (fPanelBpp == 3) {
++	if (fPanelBpp == 3 || fPanel != 0) {
+ 		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fShadowW, fShadowH, SWEET_FB_FORMAT_BGRA) : NULL;
+ 	} else
+ #else
+@@ -479,7 +501,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+-			if (fb->fPanelBpp == 3) {
++			if (fb->fPanel != 0) {
+ 				fb->flushPanel();
+ 			}
+ #endif
+@@ -743,7 +765,7 @@ AppleCLCD::drawFrame(const uint8_t *rec, bool bilinear)
+ 		s->release();
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+-	if (fPanelBpp == 3) {
++	if (fPanel != 0) {
+ 		if (bilinear) {
+ 			flushPanelBilinear();
+ 		} else {
+@@ -821,6 +843,22 @@ AppleCLCD::flushPanel(void)
+ 	uint64_t flushStart = fDbg ? mach_absolute_time() : 0;
+ 	fDbgFlush++;
+ 	IOLockLock(fPanelLock);
++	if (fPanelBpp == 4) {
++		/* fbshadow: the cached BGRA backbuffer to the BGRA scanout buffer, one linear copy when the
++		 * strides match (the 750p MDP path), else row by row. */
++		if (fRowBytes == fPanelRowBytes) {
++			memcpy((void *)fPanel, (const void *)fPixels, (size_t)fRowBytes * fHeight);
++		} else {
++			uint32_t n = fRowBytes < fPanelRowBytes ? fRowBytes : fPanelRowBytes;
++			for (uint32_t y = 0; y < fHeight; y++) {
++				memcpy((void *)(fPanel + (uint64_t)y * fPanelRowBytes),
++				    (const void *)(fPixels + (uint64_t)y * fRowBytes), n);
++			}
++		}
++		IOLockUnlock(fPanelLock);
++		if (fDbg) { fTimFlush.add(flushStart); }
++		return;
++	}
+ 	if (fScaled) {
+ 		/* nearest sample of the logical display per panel pixel; bars rewritten each time (240 bytes a row) */
+ 		uint32_t barBytes = fBarX * 3, endBytes = (fBarX + fOutW) * 3;

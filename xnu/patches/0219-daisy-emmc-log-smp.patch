@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/daisy_log.c b/bsd/dev/daisy_log.c
+index 8042b76..d95750f 100644
+--- a/bsd/dev/daisy_log.c
++++ b/bsd/dev/daisy_log.c
+@@ -1,9 +1,12 @@
+ /*
+  * Opt-in eMMC console logging after the root vnode is installed. Replays the
+  * existing early VINCE RAM ring and follows it using a separate kernel thread.
+- * daisylog=1 requires cpus=1 and mmcrw=1. Filesystem I/O never runs inside the
+- * console path or its locks. The fixed, bounded file contains the latest
+- * logging-enabled boot; recovery can extract it read-only with SleuthKit.
++ * daisylog=1 requires cpus=1 and mmcrw=1; daisylog_smp=1 allows the same
++ * logger on a multi-core boot for performance diagnostics, accepting that the
++ * lock-free RAM ring can interleave lines between CPUs. Filesystem I/O never
++ * runs inside the console path or its locks. The fixed, bounded file contains
++ * the latest logging-enabled boot; recovery can extract it read-only with
++ * SleuthKit.
+  */
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <sys/param.h>
+@@ -158,13 +161,26 @@ dl_thread(__unused void *arg, __unused wait_result_t wr)
+ void
+ daisy_log_start(void)
+ {
+-	int enabled = 0, cpus = 0, rw = 0;
++	int enabled = 0, cpus = 0, rw = 0, smp = 0;
+ 	(void)PE_parse_boot_argn("daisylog", &enabled, sizeof(enabled));
+ 	if (enabled != 1 || dl_started) { return; }
+ 	(void)PE_parse_boot_argn("cpus", &cpus, sizeof(cpus));
+ 	(void)PE_parse_boot_argn("mmcrw", &rw, sizeof(rw));
+-	if (cpus != 1 || real_ncpus != 1 || rw != 1) {
+-		printf("DAISY EMMCLOG: requires cpus=1 and mmcrw=1\n");
++	(void)PE_parse_boot_argn("daisylog_smp", &smp, sizeof(smp));
++	if (cpus != 1 || real_ncpus != 1) {
++		/* The RAM ring is appended to without a lock: on several CPUs two
++		 * writers can interleave or lose bytes. Fine for a timing line every
++		 * four seconds, and it is the only way to get kernel evidence off an
++		 * eight-core performance boot. */
++		if (smp != 1 || real_ncpus < 2) {
++			printf("DAISY EMMCLOG: requires cpus=1 and mmcrw=1 (or daisylog_smp=1)\n");
++			return;
++		}
++		printf("DAISY EMMCLOG: daisylog_smp=1 with %u CPUs; RAM-ring lines may interleave\n",
++		    real_ncpus);
++	}
++	if (rw != 1) {
++		printf("DAISY EMMCLOG: requires cpus=1 and mmcrw=1 (or daisylog_smp=1)\n");
+ 		return;
+ 	}
+ 	dl_started = true;

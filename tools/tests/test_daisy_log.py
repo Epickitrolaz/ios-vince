@@ -12,11 +12,15 @@ TESTS = Path(__file__).resolve().parent
 
 def main():
     patch = ROOT / "xnu/patches/0190-daisy-emmc-console-log.patch"
+    smp_patch = ROOT / "xnu/patches/0219-daisy-emmc-log-smp.patch"
     with tempfile.TemporaryDirectory(prefix="daisy-log-", dir="/tmp/opencode") as tmp:
         work = Path(tmp)
         subprocess.run(["git", "init", "-q", str(work)], check=True)
         subprocess.run([
             "git", "-C", str(work), "apply", "--include=bsd/dev/daisy_log.c", str(patch),
+        ], check=True)
+        subprocess.run([
+            "git", "-C", str(work), "apply", "--include=bsd/dev/daisy_log.c", str(smp_patch),
         ], check=True)
         source = (work / "bsd/dev/daisy_log.c").read_text()
         source = re.sub(r"^#include .*\n", "", source, flags=re.M)

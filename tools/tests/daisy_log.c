@@ -14,7 +14,7 @@ fresh(void)
 	vince_conlog_pos = 0; dl_started = false;
 	locks = opens = closes = reads = writes = syncs = truncates = sleeps = starts = terminates = 0;
 	open_error = read_error = write_error = sync_error = attr_error = thread_error = 0;
-	short_write = false; arg_enabled = arg_cpus = arg_rw = real_ncpus = 1;
+	short_write = false; arg_enabled = arg_cpus = arg_rw = real_ncpus = 1; arg_smp = 0;
 }
 
 static void
@@ -39,6 +39,16 @@ main(void)
 		if (fault == 4) { arg_rw = 0; }
 		daisy_log_start(); assert(!starts && !opens && !writes);
 	}
+	/* daisylog_smp=1 logs on a multi-core boot; it does not relax mmcrw or a
+	 * one-CPU ADT, and is still off by default. */
+	fresh(); arg_cpus = 8; real_ncpus = 2; arg_smp = 1;
+	daisy_log_start(); assert(starts == 1 && !opens);
+	fresh(); arg_cpus = 8; real_ncpus = 2;
+	daisy_log_start(); assert(!starts && !opens && !writes);
+	fresh(); arg_cpus = 8; arg_smp = 1;
+	daisy_log_start(); assert(!starts && !opens && !writes);
+	fresh(); arg_cpus = 8; real_ncpus = 2; arg_smp = 1; arg_rw = 0;
+	daisy_log_start(); assert(!starts && !opens && !writes);
 	fresh(); daisy_log_start(); daisy_log_start(); assert(starts == 1 && !opens);
 	fresh(); thread_error = 5; daisy_log_start(); assert(starts == 1 && !opens);
 	/* Early replay, no duplicates, wrap across the physical end of the RAM ring. */

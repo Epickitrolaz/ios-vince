@@ -39,7 +39,7 @@ static volatile uint64_t vince_conlog_pos;
 static unsigned locks, opens, closes, reads, writes, syncs, truncates, sleeps, starts, terminates;
 static int open_error, read_error, write_error, sync_error, attr_error, thread_error;
 static bool short_write;
-static int arg_enabled, arg_cpus, arg_rw;
+static int arg_enabled, arg_cpus, arg_rw, arg_smp;
 unsigned int real_ncpus;
 
 static bool is_console_initialized(void) { return console_ready; }
@@ -103,6 +103,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int n)
 	assert(n == sizeof(int));
 	if (!strcmp(name, "daisylog")) { *(int *)out = arg_enabled; }
 	else if (!strcmp(name, "cpus")) { *(int *)out = arg_cpus; }
+	else if (!strcmp(name, "daisylog_smp")) { *(int *)out = arg_smp; }
 	else { assert(!strcmp(name, "mmcrw")); *(int *)out = arg_rw; }
 	return true;
 }
