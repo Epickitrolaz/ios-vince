@@ -1,0 +1,97 @@
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -50,6 +50,9 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/signalvar.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -1493,6 +1496,75 @@
+ 	thread_call_enter_delayed(press_call, deadline);
+ }
+ 
++/*
++ * sigat1/sigat2=\"Name:seconds\": send SIGABRT to that process at that time.
++ * ReportCrash then writes an .ips with every thread's backtrace, which is how a
++ * wedged UI (SpringBoard alive but never presenting a scene) gets diagnosed
++ * without a serial console. Names are p_comm, so \"SpringBoard\", not
++ * \"com.apple.SpringBoard\".
++ */
++static char sigat_name[2][32];
++static thread_call_t sigat_call[2];
++
++static int
++sigat_filter(proc_t p, void *arg)
++{
++	const char *name = (const char *)arg;
++	return strncmp(p->p_comm, name, MAXCOMLEN) == 0;
++}
++
++static int
++sigat_hit(proc_t p, void *arg)
++{
++	const char *name = (const char *)arg;
++	printf("DAISY SIGAT: %s pid %d abort for stack capture\n", p->p_comm, proc_getpid(p));
++	psignal(p, SIGABRT);
++	return 0;
++}
++
++static void
++sigat_step(void *p0, void *p1)
++{
++	const char *name = (const char *)p0;
++	(void)p1;
++	printf("DAISY SIGAT: firing for %s\n", name);
++	proc_iterate(PROC_ALLPROCLIST, sigat_hit, (void *)name, sigat_filter, (void *)name);
++}
++
++static void
++sigat_one(const char *argname, int slot)
++{
++	char buf[64] = { 0 };
++	char *colon;
++	uint32_t secs = 0;
++	uint64_t deadline;
++
++	if (!PE_parse_boot_argn(argname, buf, sizeof(buf)) || buf[0] == 0) {
++		return;
++	}
++	colon = strchr(buf, ':');
++	if (colon == NULL) {
++		printf("VINCE INPUT: %s expects Name:seconds\n", argname);
++		return;
++	}
++	*colon = 0;
++	secs = 0;
++	for (const char *d = colon + 1; *d >= '0' && *d <= '9'; d++) {
++		secs = secs * 10 + (uint32_t)(*d - '0');
++	}
++	if (secs == 0 || buf[0] == 0) {
++		return;
++	}
++	strlcpy(sigat_name[slot], buf, sizeof(sigat_name[slot]));
++	sigat_call[slot] = thread_call_allocate(sigat_step, sigat_name[slot]);
++	if (sigat_call[slot] == NULL) {
++		return;
++	}
++	clock_interval_to_deadline((int)secs, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sigat_call[slot], deadline);
++	printf("VINCE INPUT: %s -> SIGABRT %s at %u s\n", argname, sigat_name[slot], secs);
++}
++
+ static void
+ press_power_init(void)
+ {
+@@ -1517,6 +1589,8 @@
+ vince_input_start(void)
+ {
+ 	press_power_init();
++	sigat_one("sigat1", 0);
++	sigat_one("sigat2", 1);
+ 	int keys = 1, touch = 0; /* touch remains opt-in */
+ 	thread_t thread;
+ 
